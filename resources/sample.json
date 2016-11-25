@@ -1,0 +1,27 @@
+{
+  "oei-config": {
+    "output": [
+      {
+        "type": "java",
+        "package": "org.oie"
+      }
+    ]
+  },
+  "oei-objects": [
+    {
+      "name": "entry",
+      "fields":[
+        {
+          "name":"",
+          "type":"",
+          "ref": {
+            "object":"",
+            "field":""
+          },
+          "size":"",
+          "key":{true|false}
+        }
+      ]
+    }
+  ]
+}
