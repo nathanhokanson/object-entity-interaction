@@ -1,0 +1,1056 @@
+#!/usr/bin/perl
+
+$argSize = scalar(@ARGV);
+
+if ($argSize == 0)
+{
+	print "Usage:  sql2java [options] sql_file\n";
+	exit(1);
+}
+
+for ($i = 0; $i < $argSize; $i++)
+{
+	if ($ARGV[$i] eq "-t")    # type option
+	{
+		$i++;
+		$type = $ARGV[$i];
+	}
+	elsif ($ARGV[$i] eq "-p") # package option
+	{
+		$i++;
+		$package = $ARGV[$i];
+	}
+	elsif ($ARGV[$i] eq "-o") # overwrite option
+	{
+		$overwrite = 1;
+	}
+	elsif ($ARGV[$i] eq "-d") # destination option
+	{
+		$i++;
+		$destination = $ARGV[$i];
+	}
+	elsif ($ARGV[$i] eq "-c") # connection option
+	{
+		$i++;
+		$connMod = $ARGV[$i];
+	}
+	elsif ($ARGV[$i] eq "-i") # import option
+	{
+		$i++;
+		$importMod = $ARGV[$i];
+	}
+	elsif ($ARGV[$i] eq "-h" || $ARGV[$i] eq "-?") # help option
+	{
+		print <<EOF;
+Usage:  sql2java [options] filename ...
+Options:
+  -t <type>         This is the type of sql file to expect.
+                    The possibilities are oracle or mysql
+  -p <package>      Package in which to put generated the java files.
+                    A directory structure will be generated as per package.
+  -c                Connection modifier.  ex.  Main
+  -d <destination>  The destination directory.  If the -p option is used
+                     this will be the directory where the package path
+                     will start.  If -p is not used, the generated java 
+                     files will be placed in this directory.  This directory
+                     must exist or an error will occur
+  -o                Generated java files will overwrite existing files that are 
+                     different without prompting the user.  The default is for 
+                     the user to be prompted if the files differ.
+  -i <import list>  A comma delimeted list of import statements.  Defaults to 
+                     "com.insite.util.*"
+  -h or -?          This help text.	
+EOF
+		exit(0);
+	}
+	elsif ($i == ($argSize - 1))
+	{
+		$sql_file = $ARGV[$i];
+	}
+	else
+	{
+		print "Unrecognized option '$ARGV[$i]'.  Terminating\n";
+		exit(1);
+	}
+}
+
+if (!-e $sql_file)
+{
+	print "$sql_file does not exist\n";
+	exit(1);
+}
+open(SQLFILE, "$sql_file") or die "Could not open $sql_file";
+
+if ($destination && !$package)
+{
+	chdir $destination;
+}
+
+if ($package)
+{
+	$pPath = $package;
+	$pPath =~ s/\./\//g;
+	print "Package path =$pPath=\n";
+	`mkdir -p $pPath`;
+	chdir $pPath;
+}
+
+$importStmts = "";
+if ($importMod)
+{
+	@importClasses = split /,/, $importMod;
+	foreach (@importClasses)
+	{
+		$importStmts .= "import $_;\n";
+	}
+}
+else
+{
+	$importStmts = "import com.insite.util.*;\n";
+}
+	
+
+
+# set the newline reading delimiter
+$/ = ';';
+
+print "Preparing to open $sql_file\n";
+my $struct = {};
+while (<SQLFILE>)
+{
+	if (/create table/i && !/sequence/i)
+	{
+		parseData($type, $_, $struct);
+	}
+}
+close(SQLFILE);
+# printStruct($struct);
+createFile($struct, $type, $package, $packagePath, $overwrite, $connMod, $_);
+
+sub createFile
+{
+	print "Creating files\n";
+	my ($struct, $type, $package, $path, $overwrite, $connMod, $tableString) = @_;
+	my ($javaString, $oldFile) = ();
+	my $over = 1;
+	foreach $tableKey (keys %{$struct})
+	{
+		my $javaString = createJavaString($package, $connMod, $struct->{$tableKey});
+		print "Opening file $struct->{$tableKey}->{fileName}\n";
+		if (-e $struct->{$tableKey}->{fileName} && !$overwrite)
+		{
+			open FILE, "<$struct->{$tableKey}->{fileName}";
+			$oldFile = join "", <FILE>;
+			close FILE;
+
+			if ($oldFile ne $javaString)
+			{
+				print "$struct->{$tableKey}->{fileName} exists and is different than future file.  Do you wish to overwrite? (y|n) [y] ";
+				my $answer = <STDIN>;
+				chomp $answer;
+				if ($answer && $answer !~ /y/i)
+				{
+					$over = 0;
+				}
+			}
+		}
+
+		if ($overwrite || $over)
+		{
+			print "Writing file $struct->{$tableKey}->{fileName}\n";
+			open (FILE, ">$struct->{$tableKey}->{fileName}") or die "Could not open $struct->{$tableKey}->{fileName} for writing";
+			print FILE $javaString;
+			close(FILE);
+		}
+		print "Finished file $struct->{$tableKey}->{fileName}\n\n";
+	}
+}
+
+sub parseData
+{
+	my ($type, $data, $struct) = @_;
+	# print "Parsing Data ($data)\n";
+	$data =~ /create table\s+(\w+)\s.*/i;
+	# print "table name =$1=\n";
+	my $tableName = $1;
+	if (!exists($struct->{$tableName}))
+	{
+		createTable($struct, $tableName);
+	}
+	
+	# print "data before re:  $data\n\n";
+	$data =~ s/\s/ /sg;
+	$data =~ /\((.*)\)/i;
+	#	print "data after re:  $data\n\n";
+	$tableFields = $1;
+	#print "tableFields=$tableFields\n";
+	$tableFields =~ s/(\([^\)]*,[^\)]*\))//g;
+	#print "matched=$1=\n";
+	#print "tableFields:  $tableFields\n";
+	foreach $field (split/,/, $tableFields)
+	{
+		parseField($type, $field, $struct, $tableName);
+	}
+}
+
+sub createTable
+{
+	my ($struct, $tableName) = @_;
+
+	print "Creating table $tableName\n";
+	$struct->{$tableName} = {};
+	$struct->{$tableName}->{tableName} = $tableName;
+	$struct->{$tableName}->{className} = fullUpper($struct->{$tableName}->{tableName});
+	$struct->{$tableName}->{fileName} = $struct->{$tableName}->{className} . ".java";
+	$struct->{$tableName}->{fieldCount} = 0;
+	$struct->{$tableName}->{field} = [];
+	$struct->{$tableName}->{memberUpper} = [];
+	$struct->{$tableName}->{fullUpper} = [];
+	$struct->{$tableName}->{type} = [];
+	$struct->{$tableName}->{upperType} = [];
+	$struct->{$tableName}->{joinTables} = [];
+}
+	
+sub fullUpper
+{
+	my ($name) = @_;
+	my ($x, $upper) = ();  # variable declarations
+
+	$name =~ s/\s//g;      # get rid of white space
+
+	my @parts = split /_/, $name;
+	foreach $part (@parts)
+	{
+		@letters = split //, $part;
+		$letters[0] =~ tr/a-z/A-Z/;
+		for ($x = 1; $x < scalar(@letters); $x++)
+		{
+			$letters[$x] =~ tr/A-Z/a-z/;
+		}
+		$upper .= join "", @letters;
+	}
+	return $upper;
+}
+
+sub memberUpper
+{
+	my ($name) = @_;
+	my ($x, $k, $upper) = ();   # variable declarations
+	
+	$name =~ s/\s//g;       # remove any white space
+
+	my @parts = split /_/, $name;
+	
+	my @letters = split //, $parts[0];
+	
+	for ($x = 0; $x < scalar(@letters); $x++)
+	{
+		$letters[$x] =~ tr/A-Z/a-z/;
+	}
+	$upper .= join "", @letters;
+	
+	shift(@parts);
+	
+	$upper .= fullUpper(join "_", @parts);
+	return $upper;
+}
+
+sub parseField
+{
+	my ($type, $field, $struct, $tableName) = @_;
+	# print "Parsing Field\n";
+	if ($type =~ /oracle/i)
+	{
+		parseOracleField($field, $struct, $tableName);
+	}
+	elsif ($type =~ /mysql/i)
+	{
+		parseMysqlField($field, $struct, $tableName);
+	}
+	else
+	{
+		print "Invalid file type:  $type\n";
+		exit(0);
+	}
+}	
+
+sub parseOracleField
+{
+	my ($field, $struct) = @_;
+}
+
+sub parseMysqlField
+{
+	my ($field, $struct, $tableName) = @_;
+	my ($isAuto, @item, $isPrimaryKey) = ();
+	
+	$field =~ s/^\s+//;
+	while ($field =~ /\s\s/)
+	{
+		$field =~ s/\s\s/ /g;
+	}
+	
+	#print "beginning field=$field\n";
+	if ($field =~ /^primary key/i)
+	{
+		return;
+	}
+	elsif ($field =~ /^unique/i)
+	{
+		return;
+	}
+
+	if ($field =~ /references/i)
+	{
+		createJoin($struct, $field, $tableName);
+	}
+
+
+	#print "field before=${field}=\n";
+	#print "field after=$field=\n";
+	my $table = $struct->{$tableName};
+	# print "Parsing MySQL field =$field=\n";
+	$checkNull = 0;
+
+	# save flags so that we can make the value we store the memberUpper
+	if ($field =~ /auto_increment/i) { $isAuto = 1; }
+	if ($field =~ /primary key/i) { $isPrimaryKey = 1; } # This is a key, but not a multiple key
+
+	@item = split /\s/, $field;
+	#print "item=" . join ",", @item;
+	#print "\n";
+	
+	if ($isAuto) { $table->{auto_field} = memberUpper($item[0]); }
+	if ($isPrimaryKey) { $table->{primary_key} = memberUpper($item[0]); }
+	
+	push @{$table->{field}}, $item[0];
+	push @{$table->{memberUpper}}, memberUpper($item[0]);
+	push @{$table->{fullUpper}}, fullUpper($item[0]);
+	$table->{fieldCount}++;
+	if ($item[1] =~ /int/i && $item[1] !~ /big/i)
+	{
+		push @{$table->{type}}, "int";
+		push @{$table->{upperType}}, "Int";
+		$checkNull = 1;
+	}
+	elsif ($item[1] =~ /int/i && $item[1] =~ /big/i)
+	{
+		push @{$table->{type}}, "long";
+		push @{$table->{upperType}}, "Long";
+		$checkNull = 1;
+	}
+	elsif ($item[1] =~ /float/i || $item[1] =~ /double/i || $item[1] =~ /decimal/i)
+	{
+		push @{$table->{type}}, "double";
+		push @{$table->{upperType}}, "Double";
+		$checkNull = 1.0;
+	}
+	elsif ($item[1] =~ /text/i || $item[1] =~ /char/i)
+	{
+		push @{$table->{type}}, "String";
+		push @{$table->{upperType}}, "String";
+	}
+	elsif ($item[1] =~ /time/i)
+	{
+		push @{$table->{type}}, "Timestamp";
+		push @{$table->{upperType}}, "Timestamp";
+	}
+	elsif ($item[1] =~ /date/i)
+	{
+		push @{$table->{type}}, "Date";
+		push @{$table->{upperType}}, "Date";
+	}
+	elsif ($item[1] =~ /blob/i)
+	{
+		push @{$table->{type}}, "Blob";
+		push @{$table->{upperType}}, "Blob";
+	}
+	else
+	{
+		print "Oopps.  Missed a MySQL type:  $item[1]\n";
+		exit(0);
+	}
+
+	if ($checkNull)
+	{
+		if ($field !~ /not null/i)
+		{
+			push @{$table->{nullableFullUpper}}, fullUpper($item[0]);
+			push @{$table->{nullableUpper}}, memberUpper($item[0]);
+			push @{$table->{nullableDBField}}, $item[0];
+			push @{$table->{nullableValue}}, $checkNull;
+		}
+	}
+	
+}
+
+sub createJoin
+{
+	my ($struct, $field, $tableName) = @_;
+	while ($field =~ /\s\s/)
+	{
+		$field =~ s/\s\s/ /g;
+	}
+	#print "field=$field\n";
+	my @parts = split /\s/, $field;
+	#print "createJoin:  ";
+	#print join ",", @parts, "\n";
+	my $len = scalar (@parts);
+	my $joinTable = $parts[$len-2];
+	$parts[$len-1] =~ /\((.*)\)/;
+	my $joinField = $1;
+	
+	#print "joinField=$joinField,";
+	#print "joinTable=$joinTable,";
+	#print "tableName=$tableName,";
+	#print "parts[0]=$parts[0]\n";
+	if (!exists($struct->{$joinTable}))
+	{
+		createTable($struct, $joinTable);
+	}
+	
+	push (@{$struct->{$tableName}->{joinTables}}, [$joinTable, $parts[0], $joinField]);
+	push (@{$struct->{$joinTable}->{joinTables}}, [$tableName, $joinField, $parts[0]]);
+}
+
+sub printStruct
+{
+	my ($struct) = @_;
+	my ($table, $i, $tableKey) = ();
+	foreach $tableKey (keys %{$struct})
+	{
+		$table = $struct->{$tableKey};
+		print " Table Name:  $table->{tableName}\n";
+		print " Class Name:  $table->{className}\n";
+		print "  File Name:  $table->{fileName}\n";
+		print "Field Count:  $table->{fieldCount}\n";
+		print "Field Name\tMember Upper\tFull Upper\tType\tUpper Type\n";
+
+		for ($i = 0; $i < $table->{fieldCount}; $i++)
+		{
+			print "${$table->{field}}[$i]\t";
+			print "${$table->{memberUpper}}[$i]\t";
+			print "${$table->{fullUpper}}[$i]\t";
+			print "${$table->{type}}[$i]\t";
+			print "${$table->{upperType}}[$i]\n";
+		}
+
+		print "Join Tables:\n";
+		my $len = scalar(@{$table->{joinTables}});
+		for ($i = 0; $i < $len; $i++)
+		{
+			print "${${$table->{joinTables}}[$i]}[0]\t${${$table->{joinTables}}[$i]}[1]\t${${$table->{joinTables}}[$i]}[2]\n";
+		}
+				
+		print "\n";	
+	}
+}
+
+sub createJavaString
+{
+	my ($package, $connMod, $struct) = @_;
+	my ($i, $loop) = (0, $struct->{fieldCount});
+	my $string = "";
+	
+	my ($classMembers, $initMethods, $getSetMethods, $selectString, $openIndexes,
+		$openPreparedIfs, $packageString, $nextInit, $createValues, $createQs,
+		$createPrepStatements, $updateInit, $updateSelect, $updateList,
+		$updateUpdate, $openIfs, $sequenceCreateStatements, $setValue,
+		$setValues, $getValue, $orderBy, $fieldList, $xmlFields, $className,
+		$newIdObject, $setMember, $blobClears
+		) = ();
+	my ($fullUpper, $memberUpper, $field, $upperType, $type, $comma, $newline, $oneIndex) = ();
+	
+	if ($package)
+	{
+		$packageString = "package $package;\n";
+	}
+
+	$className = $struct->{className};
+
+	if ($struct->{auto_field})
+	{
+			$sequenceCreateStatements = <<EOF;
+			if ("mysql".equals(this._cMan.getConfig().getString("db.type")))
+			{
+				String lockQuery = "select get_lock(\\"$struct->{tableName}.lock\\", 5)";
+				super._stmt = super._cMan.get${connMod}Connection().createStatement();
+				super._stmt.executeQuery(lockQuery);
+				super._stmt.close();
+
+				String sequenceQuery = "update sequence set nextval = nextval + 1 where name = '$struct->{tableName}'";
+				super._stmt = super._cMan.get${connMod}Connection().createStatement();
+				super._stmt.executeUpdate(sequenceQuery);
+				super._stmt.close();
+
+				sequenceQuery = "select nextval from sequence where name = '$struct->{tableName}'";
+				super._stmt = super._cMan.get${connMod}Connection().createStatement();
+				super._rs = super._stmt.executeQuery(sequenceQuery);
+				super._rs.next();
+				this.$struct->{auto_field} = super._rs.getInt(1);
+				super._rs.close();			
+				super._stmt.close();
+
+				lockQuery = "select release_lock(\\"$struct->{tableName}.lock\\")";
+				super._stmt = super._cMan.get${connMod}Connection().createStatement();
+				super._stmt.executeQuery(lockQuery);
+				super._stmt.close();
+			}
+			else if ("oracle".equals(this._cMan.getConfig().getString("db.type")))
+			{
+				String sequenceQuery = "select $struct->{tableName}_$struct->{auto_field}_seq.nextval from dual";
+				super._stmt = super._cMan.get${connMod}Connection().createStatement();
+				super._rs = super._stmt.executeQuery(sequenceQuery);
+				super._rs.next();
+				this.$struct->{auto_field} = super._rs.getInt(1);
+				super._rs.close();			
+				super._stmt.close();
+			}
+EOF
+	}
+	
+	for ($i = 0; $i < $loop; $i++)
+	{
+		$fullUpper = ${$struct->{fullUpper}}[$i];
+		$memberUpper = ${$struct->{memberUpper}}[$i];
+		$field = ${$struct->{field}}[$i];
+		$upperType = ${$struct->{upperType}}[$i];
+		$type = ${$struct->{type}}[$i];		
+		
+		$oneIndex = $i + 1;
+		
+		$classMembers .= "$newline\tprivate ${$struct->{type}}[$i] ${$struct->{memberUpper}}[$i];";
+
+		$initMethods .= "$newline\t\tset${$struct->{fullUpper}}[$i](";
+		
+		$fieldList .= $comma . "\"$field\"";
+		$selectString .= $comma . "$struct->{tableName}.$field";
+		$nextInit .= "$newline\t\t\t\t\tthis.$memberUpper = super._rs.get$upperType(\"$field\");";
+		$createValues .= "$comma$field";
+		$createQs .= "$comma ?";
+		$createPrepStatements .= "${newline}\t\t\tsuper._pStmt.set$upperType($oneIndex, this.$memberUpper);";
+		$updateInit .= "$newline\t\t\t$type l$fullUpper;";
+		
+		if ($i > 0)
+		{
+			if ($i == 1){ $comma = ""; $newline = ""; }
+			$updateList .= "$comma$field = ?";
+			$updateUpdate .= "$newline\t\t\tsuper._pStmt.set$upperType($i, l$fullUpper);";
+			$comma = ", ";
+			$newline = "\n";
+		}
+
+		$orderBy .= <<EOF;
+	public void set${fullUpper}OrderBy(int pOrderBy)
+	{
+		super._order += super._orderMod + super._tableAsName + ".$field ";
+		if (pOrderBy == DBObject.ORDER_ASC)
+			super._order += " asc ";
+		else if (pOrderBy == DBObject.ORDER_DESC)
+			super._order += " desc ";
+
+		super._orderMod = ",";
+		super._useOrderBy = true;
+	}
+
+EOF
+		$setValue .= <<EOF;
+				case $i:
+					this.$memberUpper = pRS.get$upperType(pCounter);
+					break;
+EOF
+		$setValues .= <<EOF;
+			this.$memberUpper = pRS.get$upperType(pCounter.getValue());
+			pCounter.increment();
+EOF
+		$getValue .= <<EOF;
+				case $i:
+					pPStmt.set$upperType(pCounter, this.$memberUpper);
+					break;
+EOF
+		$type = ${$struct->{type}}[$i];
+
+		if ($struct->{primary_key} ne $memberUpper)
+		{
+			$xmlFields .= "$newline\t\ttemp = pDoc.createElement(\"$memberUpper\");\n";
+			$xmlFields .= "\t\ttemp.setAttribute(\"type\", \"$type\");\n";
+		}
+
+		$setMember = "\t\tthis.$memberUpper = p$fullUpper;";
+
+		if ($type eq "String" || $type eq "Date" || $type eq "Timestamp")
+		{
+			$initMethods .= "null);";
+			$openIndexes .= "\t\tint ${memberUpper}Index = 0;\n";
+			$openIfs .= <<EOF;
+			if (this.$memberUpper != null)
+			{
+				temp = new WhereStatement(this, " " + super._tableAsName + ".$field " + this.${memberUpper}Mod + " ? ", true, $i);
+				super._whereStmts.add(temp);
+			}
+		
+EOF
+			$openPreparedIfs .= <<EOF;
+				if (${memberUpper}Index > 0)
+				{
+					super._pStmt.set$upperType(${memberUpper}Index, this.$memberUpper);
+				}
+EOF
+			$updateSelect .= "$newline\t\t\tl$fullUpper = (this.$memberUpper == null) ? super._rs.get$upperType(\"$field\") : this.$memberUpper;";
+
+			if ($type eq "String")
+			{
+				$xmlFields .= "\t\ttemp.appendChild(pDoc.createCDATASection(this.$memberUpper));\n";
+			}
+			else
+			{
+				$xmlFields .= "\t\ttemp.setAttribute(\"javaDate\", new Long(this.$memberUpper.getTime()).toString());\n";
+				$xmlFields .= "\t\ttemp.appendChild(pDoc.createTextNode(this.$memberUpper.toString()));\n";
+			}
+			if ($type eq "String")
+			{
+				$setMember = <<EOF;
+		if (pModType > DBObject.GTE || pModType <= DBObject.END_LIKE)
+		{
+			this.$memberUpper = super._getLikeType(p$fullUpper, pModType);
+		}
+		else
+		{
+			this.$memberUpper = p$fullUpper;
+		}
+EOF
+			}
+
+		}
+		elsif ($type eq "double")
+		{
+			$initMethods .= "-1.0);";
+			$openIfs .= <<EOF;
+			if (this.$memberUpper > -1.0)
+			{
+				temp = new WhereStatement(this, " " + super._tableAsName + ".$field " + this.${memberUpper}Mod + this.$memberUpper, false, $i);
+				super._whereStmts.add(temp);
+			}
+		
+EOF
+			$updateSelect .= "$newline\t\t\tl$fullUpper = (this.$memberUpper == -1.0) ? super._rs.get$upperType(\"$field\") : this.$memberUpper;";
+
+			$xmlFields .= "\t\ttemp.appendChild(pDoc.createTextNode(new Double(this.$memberUpper).toString()));\n";
+		}
+		elsif ($type eq "Blob")
+		{
+			$initMethods .= "null);";
+			$blobClears .= <<EOF;
+	public boolean clear${fullUpper}Blob()
+	{
+		boolean retval = true;
+		try
+		{
+			Statement stmt = this._cMan.getConnection().createStatement();
+
+			if ("mysql".equals(this._cMan.getConfig().getString("db.type")))
+			{
+				stmt.executeUpdate("update $struct->{tableName} set $field = null where $struct->{auto_field} = " + this.$struct->{auto_field});
+			}
+			else if ("oracle".equals(this._cMan.getConfig().getString("db.type")))
+			{
+				stmt.executeUpdate("update $struct->{tableName} set $field = empty_blob() where $struct->{auto_field} = " + this.$struct->{auto_field});
+			}
+		}
+		catch (SQLException sqle)
+		{
+			Log.log(Log.ERROR, sqle, "Could not clear blob:  " + sqle.getMessage());
+			this._error = "Could not clear blob:  " + sqle.getMessage();
+			retval = false;
+		}
+		return retval;
+	}
+
+EOF
+			$updateSelect .= "$newline\t\t\tl$fullUpper = (this.$memberUpper == null) ? super._rs.get$upperType(\"$field\") : this.$memberUpper;";
+		}
+		else
+		{
+			$initMethods .= "-1);";
+			$openIfs .= <<EOF;
+			if (this.$memberUpper > -1)
+			{
+				temp = new WhereStatement(this, " " + super._tableAsName + ".$field " + this.${memberUpper}Mod + this.$memberUpper, false, $i);
+				super._whereStmts.add(temp);
+			}
+		
+EOF
+			$updateSelect .= "$newline\t\t\tl$fullUpper = (this.$memberUpper == -1) ? super._rs.get$upperType(\"$field\") : this.$memberUpper;";
+
+			if ($type eq "int")
+			{
+				$newIdObject = "Integer";
+			}
+			elsif ($type eq "long")
+			{
+				$newIdObject = "Long";
+			}
+
+			if ($struct->{primary_key} eq $memberUpper)
+			{
+				$xmlFields .= "\t\t_${className}Element.setAttribute(\"$memberUpper\", new $newIdObject(this.$memberUpper).toString());\n";
+			}
+			else
+			{
+				$xmlFields .= "\t\ttemp.appendChild(pDoc.createTextNode(new $newIdObject(this.$memberUpper).toString()));\n";
+			}
+		}
+
+		if ($struct->{primary_key} ne $memberUpper)
+		{
+			$xmlFields .= "\t\t_${className}Element.appendChild(temp);\n";
+			$xmlFields .= "\t\t_${className}Element.appendChild(pDoc.createTextNode(\"\\n\"));\n";
+		}
+
+		$getSetMethods .= <<EOF;
+	public void set$fullUpper($type p$fullUpper)
+	{
+		this.${memberUpper}Mod = super._getModType(super.EQ);
+		this.$memberUpper = p$fullUpper;
+	}
+	
+	public void set$fullUpper($type p$fullUpper, int pModType)
+	{
+		this.${memberUpper}Mod = super._getModType(pModType);
+$setMember
+	}
+
+	public $type get$fullUpper()
+	{
+		return this.$memberUpper;
+	}
+	
+EOF
+		
+		$comma = ", ";
+		$newline = "\n";
+		$classMembers .= "$newline\tprivate String ${$struct->{memberUpper}}[$i]Mod;";
+	}  # end of for loop
+	$updateUpdate .= "$newline\t\t\tsuper._pStmt.set${$struct->{upperType}}[0]($i, this.${$struct->{memberUpper}}[0]);";
+	
+	$nullSet = "";
+	$nullInit = "";
+	$nullUseMethods = "";
+	$nullOpenStmts = "";
+
+	$loop = scalar(@{$struct->{nullableFullUpper}});
+	for ($i = 0; $i < $loop; $i++)
+	{
+		$nullableFull = ${$struct->{nullableFullUpper}}[$i];
+		$nullableMem  = ${$struct->{nullableUpper}}[$i];
+		$nullDBField = ${$struct->{nullableDBField}}[$i];
+		$nullValue = ${$struct->{nullableValue}}[$i];
+		$nullSet .= "\tprivate boolean useNull$nullableFull = false;\n";
+		$nullSet .= "\tprivate boolean ${nullableMem}Null = false;\n";
+		$nullInit .= "\t\tthis.useNull$nullableFull = false;\n";
+		$nullUseMethods .= <<EOF;
+	public void set${nullableFull}Null(boolean p$nullableFull)
+	{
+		this.useNull$nullableFull = true;
+		this.${nullableMem}Null = p$nullableFull;
+	}
+
+EOF
+
+
+		$nullOpenStmts .= <<EOF;
+			if (this.useNull$nullableFull)
+			{
+				whereClause = " (" + super._tableAsName + ".$nullDBField ";
+				if (this.${nullableMem}Null)
+					whereClause += " is null or " + super._tableAsName + ".$nullDBField < 1)";
+				else
+					whereClause += " is not null and " + super._tableAsName + ".$nullDBField > 0)";
+				temp = new WhereStatement(this, whereClause, false, -1);
+				super._whereStmts.add(temp);
+			}
+
+EOF
+	}
+	
+	my $joinTableIndex = "";
+	$loop = scalar(@{$struct->{joinTables}});
+	my $joinTables = "\t\tsuper._joinTables = new String[$loop][4];\n";
+	for ($i = 0; $i < $loop; $i++)
+	{
+		$joinTables .= "\t\tsuper._joinTables[$i][0] = \"${${$struct->{joinTables}}[$i]}[0]\";\n";
+		$joinTables .= "\t\tsuper._joinTables[$i][1] = \"${${$struct->{joinTables}}[$i]}[1]\";\n";
+		$joinTables .= "\t\tsuper._joinTables[$i][2] = \"${${$struct->{joinTables}}[$i]}[2]\";\n";
+		$joinTables .= "\t\tsuper._joinTables[$i][3] = \" = \";\n";
+		$joinTableIndex .= "\t\tsuper._joinTableIndex.put(\"${${$struct->{joinTables}}[$i]}[0]\", new Integer($i));\n";
+	}
+	
+		
+
+
+	
+	$string .= <<EOF;
+/*
+\$Source\$
+\$Revision\$
+\$Author\$
+\$Date\$
+
+\$Log\$
+\$Id\$
+
+*/
+
+$packageString
+$importStmts
+import java.sql.*;
+import java.util.Vector;
+import java.util.Enumeration;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+
+public class $struct->{className} extends DBObject
+{
+	private String RCSID = "@(#)\$Id\$";
+	
+$classMembers
+
+$nullSet
+
+	private String[] _fields = {$fieldList};
+	private String _tableName = "$struct->{tableName}";
+	private String _tableAsName = "$struct->{tableName}";
+	
+	public $struct->{className} () {}
+	public $struct->{className} (ConnMan pCMan)
+	{
+		super._setTableName(this._tableName);
+		super._setFields(this._fields);
+		super._cMan = pCMan;
+		init();
+
+
+$joinTableIndex
+	}
+	
+	public void init()
+	{
+$initMethods
+$nullInit
+		super._useOrderBy = false;
+		super._order = "";
+		super._query = null;
+		super._error = null;
+		super._whereStmts = new Vector();
+		super._whereClauseBuilt = false;
+		super._joinObjects = new Vector();
+		super._orderMod = "";
+$joinTables
+		super._tableAsName = this._tableName + this.toString().substring(this.toString().lastIndexOf("@")+1);
+	}
+
+$getSetMethods
+$orderBy
+$nullUseMethods
+	public boolean open()
+	{
+		super._conn = super._cMan.get${connMod}Connection();
+		return super.open();
+	}
+
+	public boolean _setValue(int pIndex, int pCounter, ResultSet pRS)
+	{
+		boolean retval = true;
+		try 
+		{
+			switch (pIndex)
+			{
+$setValue
+			}
+		}
+		catch (SQLException sqle)
+		{
+			super._error = "$package.$struct->{className}._setValue:  " + sqle.getMessage();
+			retval = false;
+		}
+		return retval;
+	}
+
+	public boolean _setValues(IntIncrement pCounter, ResultSet pRS)
+	{
+		boolean retval = true;
+		try
+		{
+$setValues
+			if (super._useJoinTables)
+			{
+				Enumeration tables = _joinObjects.elements();
+				DBObject table = null;
+				while (tables.hasMoreElements())
+				{
+					table = (DBObject) tables.nextElement();
+					table._setValues(pCounter, pRS);
+				}
+			}
+		}
+		catch (SQLException sqle)
+		{
+			super._error = "$package.$struct->{className}._setValues:  " + sqle.getMessage();
+			retval = false;
+		}
+		return retval;
+	}
+
+	public boolean _getValue(int pIndex, int pCounter, PreparedStatement pPStmt)
+	{
+		boolean retval = true;
+		try
+		{
+			switch (pIndex)
+			{
+$getValue
+			}
+		}
+		catch (SQLException sqle)
+		{
+			super._error = "$package.$struct->{className}._getValue:  " + sqle.getMessage();
+			retval = false;
+		}
+		return retval;
+	}
+
+$blobClears
+
+	public Element getXMLTree(Document pDoc)
+	{
+		Element temp = null;
+		Element _${className}Element = pDoc.createElement("$className");
+
+		// set up all of the members of this class
+$xmlFields
+		
+		// set up all of the joined objects
+		if (super._useJoinTables)
+		{
+			DBObject child = null;
+			Enumeration children = _joinObjects.elements();
+			while (children.hasMoreElements())
+			{
+				child = (DBObject) children.nextElement();
+				_${className}Element.appendChild(child.getXMLTree(pDoc));
+			}
+		}
+		return _${className}Element;
+	}
+
+	public Enumeration _getWhereClause()
+	{
+		WhereStatement temp;
+		String whereClause = "";
+		DBObject table;
+
+		if (!super._whereClauseBuilt)
+		{
+$openIfs
+$nullOpenStmts
+			if (super._useJoinTables)
+			{
+				int tableIndex;
+				Enumeration tables = _joinObjects.elements();
+				Enumeration whereClauseEnum;
+				String tempOrderBy = null;
+				while (tables.hasMoreElements())
+				{
+					table = (DBObject) tables.nextElement();
+					whereClauseEnum = table._getWhereClause();
+					while (whereClauseEnum.hasMoreElements())
+					{
+						temp = (WhereStatement) whereClauseEnum.nextElement();
+						super._whereStmts.add(temp);
+					}
+					tableIndex = ((Integer) _joinTableIndex.get(table._getTableName())).intValue();
+
+					whereClause = table._getTableAsName() + "." + super._joinTables[tableIndex][2];
+					whereClause += super._joinTables[tableIndex][3] + super._tableAsName + "." + super._joinTables[tableIndex][1];
+					temp = new WhereStatement(this, whereClause, false, -1);
+					super._whereStmts.add(temp);
+				}
+			}
+			super._whereClauseBuilt = true;
+		}
+		return super._whereStmts.elements();
+	}
+	
+	public boolean create()
+	{
+		boolean ret = true;
+		try
+		{
+
+$sequenceCreateStatements
+			super._query = "insert into $struct->{tableName} ($createValues) values ($createQs)";
+			super._pStmt = super._cMan.get${connMod}Connection().prepareStatement(super._query);
+$createPrepStatements			
+			super._pStmt.executeUpdate();
+			super._pStmt.close();
+		}
+		catch (Exception e)
+		{
+			ret = false;
+			super._error = "$struct->{className}.create:  "+e.getMessage();
+		}
+		return ret;
+	}
+	
+	public boolean update()
+	{
+		boolean ret = true;
+		try
+		{
+$updateInit
+
+			String query = "select $selectString from $struct->{tableName} where ${$struct->{field}}[0] = " + this.${$struct->{memberUpper}}[0];
+			super._stmt = super._cMan.get${connMod}Connection().createStatement();
+			super._rs = super._stmt.executeQuery(query);
+			super._rs.next();
+$updateSelect
+			super._rs.close();
+			super._stmt.close();
+			
+			super._query = "update $struct->{tableName} set $updateList where ${$struct->{field}}[0] = ?";
+			super._pStmt = super._cMan.get${connMod}Connection().prepareStatement(super._query);
+$updateUpdate
+			super._pStmt.executeUpdate();
+			super._pStmt.close();
+		}
+		catch (Exception e)
+		{
+			ret = false;
+			super._error = "$struct->{className}.update:  " + e.getMessage();
+		}
+		return ret;
+	}
+	
+	public boolean delete()
+	{
+		boolean ret = true;
+		try
+		{
+			// work this so that we can have referenced fields in the delete
+			Statement deleteStmt = super._cMan.get${connMod}Connection().createStatement();
+			deleteStmt.executeUpdate(
+				"delete from $struct->{tableName} where ${$struct->{field}}[0] = " + this.${$struct->{memberUpper}}[0]
+			);
+			deleteStmt.close();
+		}
+		catch (Exception e)
+		{
+			ret = false;
+			super._error = "$struct->{className}.delete:  " + e.getMessage();
+		}
+		return ret;
+	}
+}
+EOF
+	return $string;
+}
